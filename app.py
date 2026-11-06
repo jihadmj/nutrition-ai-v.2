@@ -69,9 +69,46 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🥗 Nutrition Intelligence")
-st.caption("Understand your meal. Make informed food choices.")
+st.markdown(
+    """
+    <style>
+    .welcome-banner {
+        background:
+            linear-gradient(90deg, rgba(20, 24, 29, 0.88), rgba(20, 24, 29, 0.20)),
+            url("https://images.unsplash.com/photo-1547592180-85f173990554");
+        background-size: cover;
+        background-position: center;
+        border-radius: 10px;
+        padding: 54px 32px;
+        color: white;
+        margin-bottom: 22px;
+    }
 
+    .welcome-banner h1 {
+        color: white;
+        font-size: clamp(28px, 3vw, 42px);
+        font-weight: 650;
+        margin: 0 0 12px 0;
+    }
+
+    .welcome-banner p {
+        color: white;
+        font-size: 17px;
+        margin: 0;
+        max-width: 650px;
+    }
+    </style>
+
+    <div class="welcome-banner">
+        <h1>Welcome back, Jihad!</h1>
+        <p>
+            Upload a meal photo, review the foods we identify,
+            and understand your nutrition.
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 st.info(
     "Prototype notice: AI food identification and portion sizes can be wrong. "
     "Review detected foods before calculating nutrition."
