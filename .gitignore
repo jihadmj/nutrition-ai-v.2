@@ -4,3 +4,5 @@ data/raw/
 __pycache__/
 *.pyc
 data/samples/
+# Local user profile data
+user_profile.json
