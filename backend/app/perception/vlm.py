@@ -1,9 +1,13 @@
+import logging
+
 from google import genai
 from google.genai import types
 
 from ..config import GEMINI_API_KEY, GEMINI_MODEL
 from ..nutrition.foods import load_foods
 from .models import VisionResult
+
+logger = logging.getLogger(__name__)
 
 _client = None
 
@@ -26,13 +30,85 @@ FOOD LIST (code | name):
 """
 
 
+def _http_options() -> types.HttpOptions:
+    """Time out instead of hanging, and retry Google's temporary 5xx errors."""
+    options = {"timeout": 90_000}  # milliseconds
+    retry = getattr(types, "HttpRetryOptions", None)
+    if retry is not None:
+        options["retry_options"] = retry(
+            attempts=3, initial_delay=1.0, http_status_codes=[500, 502, 503, 504]
+        )
+    try:
+        return types.HttpOptions(**options)
+    except Exception:  # older SDKs without retry support
+        return types.HttpOptions(timeout=options["timeout"])
+
+
 def _get_client():
     global _client
     if _client is None:
         if not GEMINI_API_KEY:
             raise RuntimeError("GEMINI_API_KEY is not set in .env")
-        _client = genai.Client(api_key=GEMINI_API_KEY)
+        _client = genai.Client(api_key=GEMINI_API_KEY, http_options=_http_options())
     return _client
+
+
+def explain_failure(exc: Exception) -> str:
+    """Turn an API or network error into a short message the user can act on."""
+    if isinstance(exc, RuntimeError) and "GEMINI_API_KEY" in str(exc):
+        return (
+            "No Gemini API key was found. Add GEMINI_API_KEY to the .env file "
+            "in your project folder, then restart the app."
+        )
+
+    code = getattr(exc, "code", None)
+    detail = str(getattr(exc, "message", "") or exc)
+    if GEMINI_API_KEY:
+        detail = detail.replace(GEMINI_API_KEY, "***")  # never echo the key
+    detail = " ".join(detail.split())[:200]
+    lowered = detail.lower()
+
+    if code == 401 or (code in (400, 403) and "api key" in lowered):
+        return (
+            "Google rejected the API key. Check GEMINI_API_KEY in .env: it should "
+            "be the full key, with no spaces or extra characters."
+        )
+    if code == 403:
+        return f"Google denied access for this key or model. Details: {detail}"
+    if code == 404:
+        other = "gemini-3.5-flash-lite" if GEMINI_MODEL == "gemini-3.8-flash" else "gemini-3.8-flash"
+        return (
+            f"The model '{GEMINI_MODEL}' is not available to this key. Set "
+            f"GEMINI_MODEL in .env to another current model, for example {other}."
+        )
+    if code == 429:
+        return (
+            "The Gemini quota or rate limit was reached. Wait a minute and try "
+            "again, or check your quota in Google AI Studio."
+        )
+    if isinstance(code, int) and code >= 500:
+        return "Google's Gemini service is busy or temporarily down. Please try again in a moment."
+    if code == 400:
+        return f"Gemini could not process this request. Details: {detail}"
+    if isinstance(exc, ValueError):  # pydantic: the model's reply didn't match the schema
+        return "Gemini returned an answer in an unexpected format. Please try again."
+    if isinstance(exc, TimeoutError) or "timed out" in lowered or "timeout" in lowered:
+        return "The request to Gemini timed out. Check your internet connection and try again."
+    if any(w in lowered for w in ("connect", "resolution", "network", "unreachable")):
+        return "Could not reach Gemini. Check your internet connection."
+    return f"Unexpected error ({type(exc).__name__})."
+
+
+def check_connection() -> tuple[bool, str]:
+    """Send a tiny text request so users can verify their key and model."""
+    try:
+        _get_client().models.generate_content(
+            model=GEMINI_MODEL, contents="Reply with the single word: ok"
+        )
+    except Exception as exc:
+        logger.warning("Gemini connection test failed: %r", exc)
+        return False, explain_failure(exc)
+    return True, f"Connected. Photo analysis will use {GEMINI_MODEL}."
 
 
 def _vocabulary() -> str:

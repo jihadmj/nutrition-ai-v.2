@@ -1,7 +1,11 @@
+import logging
+
 from ..nutrition.foods import get_food, load_foods, search_foods
 from .image import prepare_image
 from .models import AnalysisResult, Candidate
-from .vlm import detect_foods
+from .vlm import detect_foods, explain_failure
+
+logger = logging.getLogger(__name__)
 
 CONFIRM_BELOW = 0.6
 FUZZY_MIN = 0.75
@@ -25,9 +29,10 @@ def analyze_image(raw: bytes) -> AnalysisResult:
     try:
         vision = detect_foods(prepared)
     except Exception as exc:
+        logger.exception("Vision request failed")  # full details in the terminal
         return AnalysisResult(
             status="error",
-            message=f"The vision service is unavailable ({type(exc).__name__}). You can add foods manually.",
+            message=f"{explain_failure(exc)} You can add foods manually.",
         )
 
     if vision.scene_type == "menu":
