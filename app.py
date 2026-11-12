@@ -5,6 +5,7 @@ import html
 import io
 import json
 import sys
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 
@@ -17,11 +18,20 @@ from backend.app.perception.pipeline import analyze_image
 from backend.app.nutrition.foods import load_foods
 from backend.app.nutrition.engine import compute_meal
 from backend.app.schemas import MealItem
+from backend.app.api_models import ReportRequest
+from backend.app.personalization.models import UserProfile
+from backend.app.personalization.targets import daily_targets
+from backend.app.service import run_report
 
 try:
-    from backend.app.config import GEMINI_API_KEY
+    from backend.app.config import GEMINI_API_KEY, GEMINI_MODEL
 except Exception:  # if config can't load, let the analyzer report the problem
-    GEMINI_API_KEY = "unknown"
+    GEMINI_API_KEY, GEMINI_MODEL = "unknown", "unknown"
+
+try:
+    from backend.app.perception.vlm import check_connection
+except ImportError:  # older backend without the connection test
+    check_connection = None
 
 API_KEY_MISSING = not GEMINI_API_KEY
 
@@ -36,6 +46,39 @@ ACTIVITY_LEVELS = [
     "Extra active",
 ]
 GOALS = ["Maintain weight", "Gradual weight loss", "Gradual muscle gain"]
+DIETS = ["omnivore", "vegetarian", "pescatarian"]
+MEALS = ["breakfast", "lunch", "dinner", "snack"]
+
+# How the app's friendly choices map onto the backend's profile model.
+SEX_FOR = {"Male equation": "male", "Female equation": "female"}
+ACTIVITY_FOR = {
+    "Sedentary": "sedentary",
+    "Lightly active": "light",
+    "Moderately active": "moderate",
+    "Very active": "active",
+    "Extra active": "active",
+}
+GOAL_FOR = {
+    "Maintain weight": "maintain",
+    "Gradual weight loss": "lose",
+    "Gradual muscle gain": "gain",
+}
+
+NUTRIENT_LABELS = {
+    "energy_kcal": "Energy (kcal)",
+    "protein_g": "Protein (g)",
+    "fat_g": "Fat (g)",
+    "carb_g": "Carbohydrates (g)",
+    "fiber_g": "Fiber (g)",
+    "sodium_mg": "Sodium (mg)",
+    "calcium_mg": "Calcium (mg)",
+    "iron_mg": "Iron (mg)",
+    "vitamin_a_rae_mcg": "Vitamin A (µg RAE)",
+    "vitamin_c_mg": "Vitamin C (mg)",
+    "folate_mcg": "Folate (µg)",
+}
+KIND_TEXT = {"goal": "aim near", "min": "at least", "max": "at most"}
+STATUS_TEXT = {"low": ("Low", "low"), "ok": ("On track", "high"), "high": ("High", "low")}
 
 DEFAULT_PROFILE = {
     "name": "there",
@@ -45,6 +88,9 @@ DEFAULT_PROFILE = {
     "equation": EQUATIONS[0],
     "activity": ACTIVITY_LEVELS[0],
     "goal": GOALS[0],
+    "diet": "omnivore",
+    "avoid": [],
+    "budget_bdt": 0.0,
     "dark_mode": False,
 }
 
@@ -52,7 +98,7 @@ EQUATION_HELP = (
     "Choose the equation parameter that best fits you. "
     "This is a calculation setting, not a gender identity label."
 )
-ONBOARDING_STEPS = 8
+ONBOARDING_STEPS = 9
 
 # Streamlit 1.50+ replaced use_container_width with width="stretch".
 _VERSION = tuple(int(p) for p in st.__version__.split(".")[:2] if p.isdigit())
@@ -98,10 +144,17 @@ def normalize_profile(raw):
     """Fill gaps and clamp values so a hand-edited file can't break the UI."""
     profile = {**DEFAULT_PROFILE, **(raw or {})}
     profile["name"] = str(profile["name"]).strip() or DEFAULT_PROFILE["name"]
-    profile["age"] = int(_number(profile["age"], 18, 100, 25))
-    profile["height_cm"] = _number(profile["height_cm"], 91, 244, 165.0)
-    profile["weight_kg"] = _number(profile["weight_kg"], 30, 300, 65.0)
+    profile["age"] = int(_number(profile["age"], 18, 80, 25))
+    profile["height_cm"] = _number(profile["height_cm"], 130, 220, 165.0)
+    profile["weight_kg"] = _number(profile["weight_kg"], 35, 200, 65.0)
     profile["dark_mode"] = bool(profile.get("dark_mode"))
+    if profile["diet"] not in DIETS:
+        profile["diet"] = "omnivore"
+    avoid = profile.get("avoid") or []
+    if isinstance(avoid, str):
+        avoid = avoid.split(",")
+    profile["avoid"] = [str(w).strip() for w in avoid if str(w).strip()][:20]
+    profile["budget_bdt"] = _number(profile.get("budget_bdt"), 0, 5000, 0.0)
 
     for key, options in (
         ("equation", EQUATIONS),
@@ -114,55 +167,58 @@ def normalize_profile(raw):
     return profile
 
 
-def estimate_daily_targets(age, height_cm, weight_kg, equation, activity, goal):
-    """Approximate adult energy needs using Mifflin-St Jeor."""
-
-    if equation == "Male equation":
-        bmr = 10 * weight_kg + 6.25 * height_cm - 5 * age + 5
-    else:
-        bmr = 10 * weight_kg + 6.25 * height_cm - 5 * age - 161
-
-    activity_factors = {
-        "Sedentary": 1.2,
-        "Lightly active": 1.375,
-        "Moderately active": 1.55,
-        "Very active": 1.725,
-        "Extra active": 1.9,
-    }
-
-    maintenance = bmr * activity_factors[activity]
-
-    goal_adjustments = {
-        "Maintain weight": 0,
-        "Gradual weight loss": -300,
-        "Gradual muscle gain": 200,
-    }
-
-    estimated_calories = round(maintenance + goal_adjustments[goal])
-
-    # Conservative demo safeguard; this is not a universal
-    # minimum calorie requirement for every adult.
-    calories = max(1200, estimated_calories)
-
-    protein = round(1.2 * weight_kg)
-
-    return {
-        "calories_kcal": calories,
-        "protein_g": protein,
-        "maintenance_kcal": round(maintenance),
-        "used_calorie_floor": estimated_calories < 1200,
-    }
+def to_backend_profile(profile):
+    """Map the app's profile onto the backend's UserProfile model."""
+    return UserProfile(
+        name=profile["name"],
+        age=int(profile["age"]),
+        sex=SEX_FOR[profile["equation"]],
+        weight_kg=float(profile["weight_kg"]),
+        height_cm=float(profile["height_cm"]),
+        activity=ACTIVITY_FOR[profile["activity"]],
+        goal=GOAL_FOR[profile["goal"]],
+        diet=profile["diet"],
+        avoid=profile["avoid"],
+        budget_bdt_per_day=profile["budget_bdt"] or None,
+    )
 
 
 def targets_for(profile):
-    return estimate_daily_targets(
-        profile["age"],
-        profile["height_cm"],
-        profile["weight_kg"],
-        profile["equation"],
-        profile["activity"],
-        profile["goal"],
-    )
+    """Daily targets from the backend, so the sidebar and the meal check agree."""
+    result = daily_targets(to_backend_profile(profile))
+    return {
+        "calories_kcal": int(result.targets["energy_kcal"].value),
+        "protein_g": int(round(result.targets["protein_g"].value)),
+        "used_calorie_floor": result.kcal_floor_applied,
+    }
+
+
+def default_meal_index():
+    hour = datetime.now().hour
+    return 0 if hour < 11 else 1 if hour < 16 else 3 if hour < 19 else 2
+
+
+def calculate_meal(items, meal, profile, out_of_stock=()):
+    """Meal totals, plus the personalized report when it can be built."""
+    st.session_state["meal_totals"] = compute_meal(items)
+    st.session_state["meal_request"] = {
+        "items": [item.model_dump() for item in items],
+        "meal": meal,
+    }
+    try:
+        response = run_report(
+            ReportRequest(
+                items=items,
+                profile=to_backend_profile(profile),
+                meal=meal,
+                out_of_stock=list(out_of_stock),
+            )
+        )
+    except Exception:
+        st.session_state["meal_report"] = None
+        return
+    st.session_state["meal_totals"] = response.totals
+    st.session_state["meal_report"] = response
 
 
 def ft_in_from_cm(height_cm):
@@ -178,7 +234,7 @@ def clear_review_state():
     for key in list(st.session_state.keys()):
         if key.startswith(REVIEW_KEY_PREFIXES):
             del st.session_state[key]
-    for key in ("meal_totals", "manual_items", "show_manual"):
+    for key in ("meal_totals", "meal_report", "meal_request", "out_of_stock", "manual_items", "show_manual"):
         st.session_state.pop(key, None)
 
 
@@ -301,7 +357,15 @@ CSS_BASE = """
 .dtable th { background: var(--tint); color: var(--heading); text-align: left; font-weight: 600; padding: 10px 14px; }
 .dtable td { padding: 10px 14px; border-top: 1px solid var(--line); color: var(--ink); }
 .dtable .num { text-align: right; font-variant-numeric: tabular-nums; }
-@media (max-width: 760px) { .kpis { grid-template-columns: repeat(2, 1fr); } .hero { padding: 28px 22px 52px 22px; min-height: 180px; } .hero::before { background: linear-gradient(rgba(var(--hero-rgb), .9), rgba(var(--hero-rgb), .72)); } [data-testid="stCheckbox"] { margin-top: 0; } }
+.mbox { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 4px 18px; margin-bottom: 8px; }
+.mline, .aline { display: grid; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line); }
+.mline:first-child, .aline:first-child { border-top: 0; }
+.mline { grid-template-columns: 1.6fr 2fr .7fr .9fr; }
+.aline { grid-template-columns: 2.2fr 1.8fr .8fr; }
+.mline .n, .aline .n { font-weight: 600; color: var(--ink); }
+.mline .s, .aline .s { color: var(--muted); font-size: .86rem; font-weight: 400; }
+.mline .p, .aline .p { text-align: right; font-variant-numeric: tabular-nums; color: var(--ink); font-weight: 600; }
+@media (max-width: 760px) { .mline, .aline { grid-template-columns: 1fr 1fr; } .kpis { grid-template-columns: repeat(2, 1fr); } .hero { padding: 28px 22px 52px 22px; min-height: 180px; } .hero::before { background: linear-gradient(rgba(var(--hero-rgb), .9), rgba(var(--hero-rgb), .72)); } [data-testid="stCheckbox"] { margin-top: 0; } }
 """
 
 CSS_DARK = """
@@ -434,9 +498,10 @@ def tiles_html(targets):
 
 def floor_warning():
     st.warning(
-        "The calculated calorie estimate was below the app's "
-        "1,200 kcal demo floor, so the displayed target was raised "
-        "to that floor. This is not a personalized medical recommendation."
+        "The calculated calorie estimate was below the app's safety floor "
+        "(1,200 kcal for the female equation, 1,500 kcal for the male "
+        "equation), so the displayed target was raised to that floor. "
+        "This is not a personalized medical recommendation."
     )
 
 
@@ -503,7 +568,7 @@ def run_onboarding():
             st.subheader("How old are you?")
             with st.form("age_form"):
                 age = st.number_input(
-                    "Your age", min_value=18, max_value=100,
+                    "Your age", min_value=18, max_value=80,
                     value=saved["age"] if "age" in draft else 23, step=1,
                 )
                 submitted = st.form_submit_button("Continue", type="primary")
@@ -517,7 +582,7 @@ def run_onboarding():
                 col_ft, col_in = st.columns(2)
                 with col_ft:
                     height_ft = st.number_input(
-                        "Feet", min_value=3, max_value=8,
+                        "Feet", min_value=4, max_value=7,
                         value=default_ft if "height_cm" in draft else 5, step=1,
                     )
                 with col_in:
@@ -533,7 +598,7 @@ def run_onboarding():
             st.subheader("What's your current weight?")
             with st.form("weight_form"):
                 weight_kg = st.number_input(
-                    "Weight (kg)", min_value=30.0, max_value=300.0,
+                    "Weight (kg)", min_value=35.0, max_value=200.0,
                     value=saved["weight_kg"], step=0.5,
                 )
                 submitted = st.form_submit_button("Continue", type="primary")
@@ -573,6 +638,30 @@ def run_onboarding():
                 submitted = st.form_submit_button("Continue", type="primary")
             if submitted:
                 go("goal", goal)
+
+        elif step == 8:
+            st.subheader("Any food preferences?")
+            st.caption("Used to flag conflicts and suggest suitable add-ons. You can skip this.")
+            with st.form("diet_form"):
+                diet = st.selectbox(
+                    "Diet", DIETS, index=DIETS.index(saved["diet"]),
+                    format_func=str.capitalize,
+                )
+                avoid = st.text_input(
+                    "Foods to avoid (comma separated)",
+                    value=", ".join(saved["avoid"]),
+                    placeholder="for example: prawn, egg",
+                )
+                budget = st.number_input(
+                    "Daily food budget in BDT (0 = no limit)",
+                    min_value=0.0, max_value=5000.0,
+                    value=float(saved["budget_bdt"]), step=10.0,
+                )
+                submitted = st.form_submit_button("Continue", type="primary")
+            if submitted:
+                draft["diet"] = diet
+                draft["avoid"] = [w.strip() for w in avoid.split(",") if w.strip()]
+                go("budget_bdt", float(budget))
 
         else:
             st.subheader(f"You're all set, {saved['name']}")
@@ -637,19 +726,19 @@ with st.sidebar:
         with st.form("nutrition_profile"):
             name = st.text_input("Name", value=profile["name"])
             age = st.number_input(
-                "Age (years)", min_value=18, max_value=100, value=profile["age"]
+                "Age (years)", min_value=18, max_value=80, value=profile["age"]
             )
             col_ft, col_in = st.columns(2)
             with col_ft:
                 height_ft = st.number_input(
-                    "Height (feet)", min_value=3, max_value=8, value=default_ft
+                    "Height (feet)", min_value=4, max_value=7, value=default_ft
                 )
             with col_in:
                 height_in = st.number_input(
                     "Extra inches", min_value=0, max_value=11, value=default_in
                 )
             weight_kg = st.number_input(
-                "Weight (kg)", min_value=30.0, max_value=300.0,
+                "Weight (kg)", min_value=35.0, max_value=200.0,
                 value=profile["weight_kg"], step=0.5,
             )
             equation = st.selectbox(
@@ -662,6 +751,17 @@ with st.sidebar:
                 help="Choose the level that best describes your usual activity.",
             )
             goal = st.selectbox("Goal", GOALS, index=GOALS.index(profile["goal"]))
+            diet = st.selectbox(
+                "Diet", DIETS, index=DIETS.index(profile["diet"]),
+                format_func=str.capitalize,
+            )
+            avoid = st.text_input(
+                "Foods to avoid (comma separated)", value=", ".join(profile["avoid"])
+            )
+            budget = st.number_input(
+                "Daily food budget (BDT, 0 = none)", min_value=0.0, max_value=5000.0,
+                value=float(profile["budget_bdt"]), step=10.0,
+            )
             submitted = st.form_submit_button(
                 "Save and update targets", type="primary"
             )
@@ -676,6 +776,9 @@ with st.sidebar:
                     "equation": equation,
                     "activity": activity,
                     "goal": goal,
+                    "diet": diet,
+                    "avoid": avoid,
+                    "budget_bdt": float(budget),
                     "dark_mode": profile["dark_mode"],
                 }
             )
@@ -693,6 +796,25 @@ with st.sidebar:
         )
         if st.button("Delete profile and start over"):
             reset_profile()
+
+    with st.expander("Photo analysis connection", expanded=API_KEY_MISSING):
+        if API_KEY_MISSING:
+            st.warning("No Gemini API key was found.")
+            st.markdown(
+                "1. Create a key at [Google AI Studio](https://aistudio.google.com/apikey).\n"
+                "2. In your project folder (next to `app.py`), create a file named "
+                "`.env` containing `GEMINI_API_KEY=your_key`.\n"
+                "3. Restart the app."
+            )
+            st.caption("On Windows, make sure the file isn't named .env.txt.")
+        else:
+            st.caption(f"Key found. Model: {GEMINI_MODEL}")
+            if check_connection is None:
+                st.caption("Update the backend files to enable the connection test.")
+            elif st.button("Test connection"):
+                with st.spinner("Contacting Gemini..."):
+                    connected, message = check_connection()
+                (st.success if connected else st.error)(message)
 
     targets_disclaimer()
 
@@ -748,6 +870,13 @@ with col_upload:
     with col_manual:
         if st.button("Add a food manually"):
             st.session_state["show_manual"] = True
+
+    if API_KEY_MISSING:
+        html_block(
+            '<div class="hint">Photo analysis needs a Gemini API key. Open '
+            "<strong>Photo analysis connection</strong> in the sidebar to set it "
+            "up, or add foods manually.</div>"
+        )
 
     if analyze_clicked and uploaded:
         with st.spinner("Analyzing your meal..."):
@@ -978,12 +1107,17 @@ if show_review:
             st.rerun()
 
     if detected or manual_items:
+        st.radio(
+            "Which meal is this?", MEALS, index=default_meal_index(),
+            horizontal=True, format_func=str.capitalize, key="meal_type",
+        )
         if st.button("Calculate nutrition", type="primary"):
             if not edited_items:
                 st.warning("Include at least one food item.")
             else:
+                st.session_state.pop("out_of_stock", None)
                 try:
-                    st.session_state["meal_totals"] = compute_meal(edited_items)
+                    calculate_meal(edited_items, st.session_state["meal_type"], profile)
                 except Exception as exc:
                     st.error(f"Could not calculate nutrition: {exc}")
 
@@ -991,6 +1125,131 @@ if show_review:
 # --------------------------------------------------
 # 8. Nutrition report and daily target comparison
 # --------------------------------------------------
+
+def md_safe(text):
+    return str(text).replace("*", "\\*")
+
+
+def label_of(key):
+    return NUTRIENT_LABELS.get(key, key)
+
+
+def meal_check_html(lines):
+    rows = []
+    for ln in lines:
+        text, css = STATUS_TEXT[ln.status]
+        over = "" if ln.status == "ok" else " over"
+        star = " *" if ln.partial_data else ""
+        rows.append(
+            '<div class="mline">'
+            f'<div class="n">{esc(label_of(ln.nutrient))}'
+            f'<div class="s">{KIND_TEXT[ln.kind]} {ln.meal_target:,.1f} for this meal</div></div>'
+            f'<div class="track"><div class="fill{over}" style="width:{min(ln.percent, 100):.1f}%"></div></div>'
+            f'<div class="p">{ln.percent:,.0f}%{star}</div>'
+            f'<div><span class="pill {css}">{text}</span></div></div>'
+        )
+    return '<div class="mbox">' + "".join(rows) + "</div>"
+
+
+def addons_html(items):
+    rows = []
+    for item in items:
+        helps = "".join(
+            f'<span class="pill">{esc(label_of(h))}</span>' for h in item.helps
+        )
+        rows.append(
+            '<div class="aline">'
+            f'<div class="n">Add {item.eat_grams:,.0f} g {esc(item.name_en)}'
+            f'<div class="s">Buy {item.buy_grams:,.0f} g from {esc(item.store)}</div></div>'
+            f"<div>{helps}</div>"
+            f'<div class="p">{item.cost_bdt:,.0f} BDT</div></div>'
+        )
+    return '<div class="mbox">' + "".join(rows) + "</div>"
+
+
+def replan(out_of_stock):
+    request = st.session_state["meal_request"]
+    items = [MealItem(**d) for d in request["items"]]
+    st.session_state["out_of_stock"] = list(out_of_stock)
+    calculate_meal(items, request["meal"], profile, out_of_stock)
+    st.session_state.pop("oos_pick", None)
+    st.rerun()
+
+
+def render_meal_check(response):
+    st.subheader("Meal check for your profile")
+    if response is None:
+        st.caption("A personalized check isn't available for this meal.")
+        return
+
+    for conflict in response.diet_conflicts:
+        st.warning(f"Diet conflict: {md_safe(conflict.name_en)} {conflict.reason}.")
+
+    report, pivot = response.report, response.pivot
+    st.caption(
+        f"Your {report.meal} compared with its share of your daily targets."
+    )
+    html_block(meal_check_html(report.lines))
+    if any(ln.partial_data for ln in report.lines):
+        st.caption(
+            "* Some foods have no data for this nutrient, so the total may be understated."
+        )
+
+    st.subheader("Add-ons to close the gaps")
+    if pivot.catalog_is_sample:
+        st.warning(
+            "Stores and prices come from a sample catalog used for development. "
+            "They are not real prices."
+        )
+
+    if pivot.status == "ok":
+        html_block(addons_html(pivot.items))
+        target_by = {ln.nutrient: ln.meal_target for ln in report.lines}
+        focus = [n for n in report.gaps if n in pivot.after and target_by.get(n)]
+        chips = "".join(
+            f'<span class="pill high">{esc(label_of(n))} '
+            f"{100 * pivot.before.get(n, 0) / target_by[n]:.0f}% → "
+            f"{100 * pivot.after[n] / target_by[n]:.0f}%</span>"
+            for n in focus
+        )
+        html_block(
+            '<div class="tiles"><div class="tile">'
+            f'<div class="v">{pivot.total_cost_bdt:,.0f} BDT</div>'
+            '<div class="l">estimated add-on cost</div></div></div>'
+            + (f'<div class="hint">Gap coverage: {chips}</div>' if chips else "")
+        )
+        if pivot.remaining_gaps:
+            st.info(
+                "Still low after these add-ons: "
+                + ", ".join(label_of(n) for n in pivot.remaining_gaps)
+            )
+
+        with st.expander("Something unavailable at your store?"):
+            names = {item.name_en: item.fct_code for item in pivot.items}
+            picked = st.multiselect(
+                "Mark these as out of stock", list(names), key="oos_pick"
+            )
+            col_find, col_reset = st.columns(2)
+            with col_find:
+                if st.button("Find alternatives") and picked:
+                    taken = set(st.session_state.get("out_of_stock", []))
+                    replan(sorted(taken | {names[p] for p in picked}))
+            with col_reset:
+                if st.session_state.get("out_of_stock") and st.button("Reset stock"):
+                    replan([])
+            if st.session_state.get("out_of_stock"):
+                st.caption(
+                    "Marked out of stock: "
+                    + ", ".join(st.session_state["out_of_stock"])
+                )
+    elif pivot.status == "nothing_needed":
+        st.success("No gaps to fill among the nutrients we track.")
+    else:
+        st.info(" ".join(pivot.notes) or "No add-on suggestion could be made.")
+
+    for note in report.notes + pivot.notes:
+        st.caption(note)
+
 
 def target_block(title, value, target, unit, decimals):
     """One daily-target comparison card, as HTML."""
@@ -1096,19 +1355,10 @@ if "meal_totals" in st.session_state:
 
     st.markdown("&nbsp;", unsafe_allow_html=True)
 
-    nutrient_labels = {
-        "energy_kcal": "Energy (kcal)",
-        "protein_g": "Protein (g)",
-        "fat_g": "Fat (g)",
-        "carb_g": "Carbohydrates (g)",
-        "fiber_g": "Fiber (g)",
-        "sodium_mg": "Sodium (mg)",
-        "calcium_mg": "Calcium (mg)",
-        "iron_mg": "Iron (mg)",
-        "vitamin_a_rae_mcg": "Vitamin A (µg RAE)",
-        "vitamin_c_mg": "Vitamin C (mg)",
-        "folate_mcg": "Folate (µg)",
-    }
+    render_meal_check(st.session_state.get("meal_report"))
+    st.markdown("&nbsp;", unsafe_allow_html=True)
+
+    nutrient_labels = NUTRIENT_LABELS
 
     tab_nutrients, tab_foods = st.tabs(["Nutrient breakdown", "Foods used"])
 
